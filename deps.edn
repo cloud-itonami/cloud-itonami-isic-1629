@@ -8,7 +8,15 @@
  ;; directly (not only under :dev) so a bare `clojure -M:test` works
  ;; offline inside the monorepo checkout without depending on
  ;; langgraph's own transitive git/sha pin being fetchable.
- :deps {io.github.kotoba-lang/langgraph
+ ;; jp-go-digital-design-system (DADS) is this workspace's BASE design
+ ;; system -- `woodcork.render-html` styles the generated operator
+ ;; console with its compat skin rather than inventing a second token
+ ;; vocabulary. Pinned by sha (git dep) since it lives outside this
+ ;; repo's :local/root sibling set.
+ :deps {io.github.kotoba-lang/jp-go-digital-design-system
+        {:git/url "https://github.com/kotoba-lang/jp-go-digital-design-system"
+         :git/sha "83db99546eabc53613ae826ea41d1533a3c574af"}
+        io.github.kotoba-lang/langgraph
         {:local/root "../../kotoba-lang/langgraph"}
         io.github.kotoba-lang/langchain
         {:local/root "../../kotoba-lang/langchain"}}
@@ -21,6 +29,10 @@
          {:local/root "../../kotoba-lang/langchain"}}}
   ;; clojure -M:dev:run  -> drive the demo through one OperationActor
   :run {:main-opts ["-m" "woodcork.sim"]}
+  ;; clojure -M:dev:render-html [out-file] -> regenerate
+  ;; docs/samples/operator-console.html by running the REAL actor
+  ;; (flagship checklist item 2). Deterministic: rerunning is a no-op.
+  :render-html {:main-opts ["-m" "woodcork.render-html"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}

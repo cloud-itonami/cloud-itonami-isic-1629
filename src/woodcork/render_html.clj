@@ -1,0 +1,480 @@
+(ns woodcork.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2: this repo previously had NO demo
+  page and no generator at all. This namespace drives the REAL actor
+  stack (`woodcork.operation` -> `woodcork.advisor` ->
+  `woodcork.governor` -> `woodcork.phase` -> `woodcork.store`) through
+  a scenario adapted from this repo's own `woodcork.sim` demo driver
+  (`clojure -M:dev:run`, run BEFORE this file was written to confirm it
+  produces a sensible ledger; every subject id it uses -- `batch-001`
+  /`batch-002`/`batch-003`, `equip-001`/`equip-002` -- was
+  cross-checked against `woodcork.store`'s own seeded sample data, so
+  reusing the scenario shape was safe here).
+
+  EVERY value on the rendered page is real output of that run:
+
+    - the batch/equipment rows are `woodcork.store`'s own records after
+      the scenario committed against them (note `batch-001`'s
+      `:shipped-unit-count` 100 -> 150: the SSoT mutation the approved
+      shipment actually performed), and their ready/blocked status is
+      computed by calling `woodcork.registry/batch-ready?` /
+      `equipment-ready?` -- the same predicates the governor itself
+      calls, not a transcription of them;
+    - the maintenance/shipment draft numbers (`MNT-000000`,
+      `SHP-000000`) are what `woodcork.registry` actually minted;
+    - the governor contract block is read straight out of
+      `woodcork.governor`'s own vars (`confidence-floor`,
+      `allowed-ops`, `allowed-proposal-effects`, `high-stakes`) and the
+      phase gate rows out of `woodcork.phase/phases`, so the page
+      cannot drift from the code it documents;
+    - the ledger and HARD-hold rows are the append-only decision facts
+      the run produced, rule names and Japanese detail strings included,
+      verbatim from `woodcork.governor`.
+
+  Nothing here is hand-typed sample data and nothing is inferred: if
+  the actor did not produce it, it is not on the page.
+
+  DETERMINISTIC: no timestamps and no randomness in the page content --
+  byte-identical across reruns against the same seed (verify by diffing
+  two consecutive runs).
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.java.io :as io]
+            [clojure.string :as str]
+            [langgraph.graph :as g]
+            [woodcork.governor :as governor]
+            [woodcork.operation :as op]
+            [woodcork.phase :as phase]
+            [woodcork.registry :as registry]
+            [woodcork.store :as store]))
+
+(def ^:private coordinator
+  {:actor-id "coord-1" :actor-role :plant-coordinator :phase 3})
+
+(defn- exec!
+  "Runs one request through the real graph and records the disposition
+  the actor reached BEFORE any human was involved -- read off the
+  graph's own final state, not asserted."
+  [actor tid request]
+  (let [r (g/run* actor {:request request :context coordinator} {:thread-id tid})]
+    {:thread tid
+     :op (:op request)
+     :subject (:subject request)
+     ;; what the governor + phase gate decided, before any human
+     :gate-disposition (get-in r [:state :disposition])
+     ;; where the run ended up (same, unless a human later approved)
+     :disposition (get-in r [:state :disposition])
+     :confidence (get-in r [:state :verdict :confidence])
+     :hard? (boolean (get-in r [:state :verdict :hard?]))
+     :approved-by nil}))
+
+(defn- approve!
+  "Resumes a step paused at `:request-approval` with a human approval
+  and records the disposition the graph then reached."
+  [actor step]
+  (let [r (g/run* actor {:approval {:status :approved :by "coord-1"}}
+                  {:thread-id (:thread step) :resume? true})]
+    (assoc step :approved-by "coord-1"
+           :disposition (get-in r [:state :disposition]))))
+
+(defn run-demo!
+  "Seeds a fresh `woodcork.store` MemStore, builds the REAL
+  WoodCorkOperationActor graph over it, and runs one scenario through
+  `langgraph.graph/run*`.
+
+  Clean lifecycle (`batch-001` on the verified, registered
+  handle-turning lathe `equip-001`): a production-batch log that
+  phase-3 AUTO-COMMITS while still governor-clean (the one op in
+  `woodcork.phase`'s phase-3 `:auto` set), then a maintenance window,
+  an equipment-safety concern and an outbound shipment -- each of which
+  the phase gate or the high-stakes gate escalates to a human plant
+  supervisor, who approves, and only then commits. That shipment is
+  what moves `batch-001`'s own `:shipped-unit-count` 100 -> 150.
+
+  HARD holds, none of which ever reaches a human -- `woodcork.operation`
+  routes a hard verdict straight from `:decide` to `:hold`, so the
+  `:request-approval` node is never entered:
+
+    - `:cutting-molding-line-finalize-blocked` -- `mnt-9` tries to
+      FINALIZE a cutting/molding/weaving-line run (`:finalize? true`)
+      rather than draft-schedule one. PERMANENT and unconditional: no
+      phase and no approver can override it, and `:schedule-maintenance`
+      is additionally absent from every phase's `:auto` set, so two
+      independent layers agree.
+    - `:equipment-not-verified` -- `mnt-2` against `equip-002`, the
+      UNVERIFIED/unregistered wicker-weaving loom.
+    - `:batch-not-verified`    -- `ship-2` against `batch-003`, the
+      UNVERIFIED/unregistered wicker batch.
+    - `:shipment-unit-count-exceeded` -- `ship-3` claims 10 units off
+      `batch-002`, whose own record already logs 75 of 80 shipped; the
+      governor recomputes the headroom itself rather than trusting the
+      claim.
+    - `:already-scheduled`     -- `mnt-1` a second time, off a dedicated
+      `:scheduled?` fact.
+    - `:invalid-product-spec` / `:invalid-output-quality` -- fabricated
+      batch facts.
+    - `:not-propose-effect`    -- a mis-wired caller whose own request
+      declares `:effect :direct-write`, caught before anything else.
+    - `:unknown-op` (+ `:equipment-control-blocked`) -- a hallucinated
+      `:actuate-lathe` direct equipment-control op.
+
+  Returns `{:db <store> :steps [<one record per request>]}`. The step
+  records carry the disposition each run actually reached (read off the
+  graph state), which is what lets the rendered page SHOW -- rather
+  than merely claim -- that no HARD hold was ever offered to a human."
+  []
+  (let [db (-> (store/mem-store) (store/sample-data!))
+        actor (op/build db)
+        steps
+        [;; ---- clean lifecycle ---------------------------------------
+         (exec! actor "t1-log"
+                {:op :log-production-batch :effect :propose :subject "batch-001"
+                 :patch {:product-spec :handle-standard :last-assessed "2026-07-14"}})
+
+         (approve! actor
+                   (exec! actor "t1-maint"
+                          {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+                           :value {:equipment-id "equip-001"
+                                   :maintenance-type :lathe-blade-and-chuck-service
+                                   :scheduled-date "2026-08-01" :finalize? false}}))
+
+         (approve! actor
+                   (exec! actor "t1-safety"
+                          {:op :flag-safety-concern :effect :propose :subject "concern-1"
+                           :value {:equipment-id "equip-001" :severity :moderate
+                                   :description "旋盤ブレードガード緩みの疑い (equipment-safety concern)"}}))
+
+         (approve! actor
+                   (exec! actor "t1-ship"
+                          {:op :coordinate-shipment :effect :propose :subject "ship-1"
+                           :value {:batch-id "batch-001" :unit-count 50
+                                   :destination "buyer-site-north"}}))
+
+         ;; ---- HARD holds (never reach a human) ------------------------
+         (exec! actor "h-finalize"
+                {:op :schedule-maintenance :effect :propose :subject "mnt-9"
+                 :value {:equipment-id "equip-001"
+                         :maintenance-type :cutting-molding-line-run-finalize
+                         :scheduled-date "2026-09-01" :finalize? true}})
+
+         (exec! actor "h-equipment"
+                {:op :schedule-maintenance :effect :propose :subject "mnt-2"
+                 :value {:equipment-id "equip-002"
+                         :maintenance-type :loom-tension-calibration
+                         :scheduled-date "2026-08-01" :finalize? false}})
+
+         (exec! actor "h-batch"
+                {:op :coordinate-shipment :effect :propose :subject "ship-2"
+                 :value {:batch-id "batch-003" :unit-count 10
+                         :destination "buyer-site-south"}})
+
+         (exec! actor "h-units"
+                {:op :coordinate-shipment :effect :propose :subject "ship-3"
+                 :value {:batch-id "batch-002" :unit-count 10
+                         :destination "buyer-site-east"}})
+
+         (exec! actor "h-double"
+                {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+                 :value {:equipment-id "equip-001"
+                         :maintenance-type :lathe-blade-and-chuck-service
+                         :scheduled-date "2026-08-01" :finalize? false}})
+
+         (exec! actor "h-spec"
+                {:op :log-production-batch :effect :propose :subject "batch-001"
+                 :patch {:product-spec :custom-oversize-novelty-item}})
+
+         (exec! actor "h-quality"
+                {:op :log-production-batch :effect :propose :subject "batch-001"
+                 :patch {:output-quality-percent 999.0}})
+
+         (exec! actor "h-effect"
+                {:op :log-production-batch :effect :direct-write :subject "batch-001"
+                 :patch {:product-spec :handle-standard}})
+
+         (exec! actor "h-op"
+                {:op :actuate-lathe :effect :propose :subject "batch-001"})]]
+    {:db db :steps steps}))
+
+;; ----------------------------- rendering -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
+
+(defn- token
+  "Readable text for one ledger token (a rule keyword, or a cited field
+  name / entity id string)."
+  [v]
+  (if (keyword? v) (str (symbol v)) (str v)))
+
+(defn- kw-list
+  "Deterministic, escaped rendering of a set of keywords."
+  [kws]
+  (->> kws (map token) sort (map #(str "<code>:" (esc %) "</code>"))
+       (str/join " ")))
+
+(defn- td [& cells] (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+
+(defn- ready-cell [ready? blocked-label]
+  (if ready?
+    "<span class=\"ok\">検証済み・登録済み</span>"
+    (str "<span class=\"critical\">" blocked-label "</span>")))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- batch-row [{:keys [id product-spec product-type unit-count
+                          shipped-unit-count output-quality-percent] :as b}]
+  (td (str "<code>" (esc id) "</code>")
+      (str "<code>" (esc product-spec) "</code>")
+      (esc product-type)
+      (esc unit-count)
+      (esc shipped-unit-count)
+      (esc output-quality-percent)
+      (ready-cell (registry/batch-ready? b) "未検証/未登録 &middot; 出荷調整不可")))
+
+(defn- equipment-row [{:keys [id kind last-maintenance-date
+                              last-scheduled-maintenance-date] :as e}]
+  (td (str "<code>" (esc id) "</code>")
+      (esc kind)
+      (if last-maintenance-date (esc last-maintenance-date) "<span class=\"muted\">—</span>")
+      (if last-scheduled-maintenance-date
+        (str "<span class=\"ok\">" (esc last-scheduled-maintenance-date) "</span>")
+        "<span class=\"muted\">—</span>")
+      (ready-cell (registry/equipment-ready? e) "未検証/未登録 &middot; 保守予定不可")))
+
+(defn- maintenance-row [{:keys [id equipment-id maintenance-type scheduled-date
+                                maintenance-number scheduled?]}]
+  (td (str "<code>" (esc id) "</code>")
+      (str "<code>" (esc equipment-id) "</code>")
+      (esc maintenance-type)
+      (esc scheduled-date)
+      (str "<code>" (esc maintenance-number) "</code>")
+      (if scheduled?
+        "<span class=\"ok\">予定確定 (draft)</span>"
+        "<span class=\"muted\">未確定</span>")))
+
+(defn- shipment-row [{:keys [id batch-id unit-count destination shipment-number]}]
+  (td (str "<code>" (esc id) "</code>")
+      (str "<code>" (esc batch-id) "</code>")
+      (esc unit-count)
+      (esc destination)
+      (str "<code>" (esc shipment-number) "</code>")))
+
+(defn- concern-row [{:keys [id equipment-id severity description]}]
+  (td (str "<code>" (esc id) "</code>")
+      (str "<code>" (esc equipment-id) "</code>")
+      (str "<span class=\"warn\">" (esc severity) "</span>")
+      (esc description)))
+
+(defn- gate-row
+  "One phase-gate row, read out of `woodcork.phase/phases` itself."
+  [{:keys [writes auto]} o]
+  (td (str "<code>" (esc o) "</code>")
+      (if (contains? writes o)
+        "<span class=\"ok\">許可</span>"
+        "<span class=\"critical\">不可</span>")
+      (if (contains? auto o)
+        "<span class=\"ok\">governor-clean なら自動コミット</span>"
+        "<span class=\"warn\">常に人間の承認が必要</span>")))
+
+(defn- step-row
+  "One request's actual route through the graph. `:gate-disposition` is
+  what the governor + phase gate decided on their own; `人間の承認` is
+  whether a human was ever asked. A HARD hold shows `否 (到達せず)` --
+  read off the run, not asserted."
+  [{:keys [op subject gate-disposition disposition confidence hard? approved-by]}]
+  (td (str "<code>" (esc op) "</code>")
+      (str "<code>" (esc subject) "</code>")
+      (if hard?
+        "<span class=\"critical\">HARD 違反あり</span>"
+        "<span class=\"ok\">違反なし</span>")
+      (case gate-disposition
+        :commit "<span class=\"ok\">自動コミット可</span>"
+        :escalate "<span class=\"warn\">人間へエスカレーション</span>"
+        :hold "<span class=\"critical\">HARD hold</span>"
+        (str "<span class=\"muted\">" (esc gate-disposition) "</span>"))
+      (if approved-by
+        (str "<span class=\"ok\">承認 &middot; <code>" (esc approved-by) "</code></span>")
+        (if (= :hold gate-disposition)
+          "<span class=\"critical\">否 (到達せず)</span>"
+          "<span class=\"muted\">不要</span>"))
+      (if (= :commit disposition)
+        "<span class=\"ok\">commit</span>"
+        "<span class=\"critical\">hold</span>")
+      (if (some? confidence) (esc confidence) "<span class=\"muted\">—</span>")))
+
+(defn- ledger-row [{:keys [t op subject disposition basis confidence phase-reason]}]
+  (td (case t
+        :committed "<span class=\"ok\">committed</span>"
+        :governor-hold "<span class=\"critical\">HARD hold</span>"
+        :approval-rejected "<span class=\"critical\">approval rejected</span>"
+        (str "<span class=\"muted\">" (esc (name t)) "</span>"))
+      (str "<code>" (esc op) "</code>")
+      (str "<code>" (esc subject) "</code>")
+      (esc (or (some->> basis seq (map token) (str/join ", "))
+               (some-> disposition name)
+               ""))
+      ;; commit facts carry no confidence field -- show that honestly
+      ;; rather than filling the cell with something the actor never said
+      (if (some? confidence) (esc confidence) "<span class=\"muted\">—</span>")
+      (if phase-reason (str "<code>" (esc phase-reason) "</code>")
+          "<span class=\"muted\">—</span>")))
+
+(defn- hold-rows
+  "One row per violation of every `:governor-hold` fact in the ledger.
+  `woodcork.operation` writes `:t :governor-hold` only from the
+  `:decide` node -- an approver's rejection is written as
+  `:approval-rejected` instead -- so every row here is structurally a
+  decision taken BEFORE any human was asked."
+  [ledger]
+  (for [{:keys [op subject violations]} ledger
+        :when (seq violations)
+        {:keys [rule detail]} violations]
+    (td (str "<code>" (esc subject) "</code>")
+        (str "<code>" (esc op) "</code>")
+        (str "<code>" (esc rule) "</code>")
+        (esc detail))))
+
+(defn- section [title lead headers rows]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" title "</h2>\n"
+       "    <p class=\"muted\">" lead "</p>\n"
+       "    <table>\n"
+       "      <thead><tr>" (str/join (map #(str "<th>" % "</th>") headers)) "</tr></thead>\n"
+       "      <tbody>\n"
+       (if (seq rows) (str (str/join "\n" rows) "\n")
+           (str "        <tr><td colspan=\"" (count headers)
+                "\"><span class=\"muted\">この実行では該当なし</span></td></tr>\n"))
+       "      </tbody>\n"
+       "    </table>\n"
+       "  </section>\n"))
+
+(defn render
+  "Renders the full operator-console document from a `run-demo!` result
+  `{:db <store> :steps [..]}` (or any other real scenario's)."
+  [{:keys [db steps]}]
+  (let [ledger (vec (store/ledger db))
+        holds (filter #(= :governor-hold (:t %)) ledger)
+        phase-3 (get phase/phases phase/default-phase)
+        shipments (keep #(store/shipment db (get % "shipment_id"))
+                        (store/shipment-history db))]
+    (str
+     "<!doctype html>\n<html lang=\"ja\"><head><meta charset=\"utf-8\">\n"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+     "<title>cloud-itonami-isic-1629 &middot; wood, cork &amp; straw products shop — Operator Console</title>\n"
+     "<style>\n" (jp-go-dds.skin/dds+skin) "\n</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>木製品・コルク製品・わら/植物繊維編組製品 工場プラント運用 (ISIC 1629) — Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · 保守作業予定/安全懸念/出荷調整は常に人間の承認が必要</span>\n"
+     "</header>\n"
+     "<main>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>この頁について</h2>\n"
+     "    <p>この頁のすべての ID・数値・判定は、ビルド時に <code>woodcork.operation</code> の実アクターグラフを "
+     "<code>langgraph.graph/run*</code> で実行した結果です。手書きのサンプル値はありません "
+     "(<code>clojure -M:dev:render-html</code> で再生成、内容は決定的)。</p>\n"
+     "  </section>\n"
+
+     (section "生産バッチ (woodcork.store SSoT)"
+              (str "検証済み/登録済みの判定は <code>woodcork.registry/batch-ready?</code> "
+                   "— ガバナー自身が呼ぶ述語をそのまま呼んだ結果です。"
+                   "<code>batch-001</code> の出荷済数は、承認された出荷調整が実際に SSoT を書き換えた後の値です。")
+              ["バッチ" "product-spec" "種別" "生産数" "出荷済" "出力品質%" "ground truth"]
+              (map batch-row (store/all-batches db)))
+
+     (section "設備 (woodcork.store SSoT)"
+              (str "検証済み/登録済みの判定は <code>woodcork.registry/equipment-ready?</code>。"
+                   "未検証・未登録の設備に対する保守作業予定は HARD hold されます。")
+              ["設備" "種別" "前回保守" "予定 (この実行)" "ground truth"]
+              (map equipment-row (store/all-equipment db)))
+
+     (section "保守作業予定ドラフト"
+              (str "コミットされた予定のみ。予定番号は <code>woodcork.registry/register-maintenance</code> "
+                   "が実際に採番したものです (署名なしドラフト — 稼働確定ではありません)。")
+              ["予定" "設備" "作業種別" "予定日" "予定番号" "状態"]
+              (map maintenance-row (store/all-maintenance db)))
+
+     (section "出荷調整ドラフト"
+              (str "コミットされた出荷のみ。出荷番号は <code>woodcork.registry/register-shipment</code> "
+                   "が実際に採番したものです (実運送手配は行いません)。")
+              ["出荷" "バッチ" "数量" "宛先" "出荷番号"]
+              (map shipment-row shipments))
+
+     (section "安全懸念ログ"
+              "追記のみ。安全懸念は常に高ステークス扱いで、必ず人間の承認を経ます。"
+              ["ID" "設備" "深刻度" "内容"]
+              (map concern-row (store/safety-concerns db)))
+
+     (section (str "フェーズゲート (phase " phase/default-phase " &middot; "
+                   (esc (:label phase-3)) ")")
+              (str "<code>woodcork.phase/phases</code> の実データから生成。"
+                   "<code>:schedule-maintenance</code> はどのフェーズの <code>:auto</code> 集合にも入りません "
+                   "— ロールアウトの未達項目ではなく、恒久的な構造上の事実です。")
+              ["Op" "phase-3 書き込み" "自動コミット"]
+              (map (partial gate-row phase-3) (sort-by token phase/write-ops)))
+
+     "  <section class=\"card\">\n"
+     "    <h2>ガバナー契約 (woodcork.governor の実データ)</h2>\n"
+     "    <p class=\"muted\">下の値はすべて <code>woodcork.governor</code> の var を読んだものです — 転記ではないので、コードと乖離しません。</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>項目</th><th>値</th></tr></thead>\n"
+     "      <tbody>\n"
+     (td "confidence floor" (str "<code>" (esc governor/confidence-floor) "</code>"))
+     "\n"
+     (td "許可される op" (kw-list governor/allowed-ops))
+     "\n"
+     (td "許可される proposal effect" (kw-list governor/allowed-proposal-effects))
+     "\n"
+     (td "常に人間の承認を要する stake" (kw-list governor/high-stakes))
+     "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     (section "この実行の経路 (各リクエストが実際に辿った分岐)"
+              (str "各行は <code>langgraph.graph/run*</code> の最終 state から読んだ実測値です。"
+                   "HARD 違反のある行はすべて「人間の承認: 否 (到達せず)」— "
+                   "<code>woodcork.operation</code> が <code>:decide</code> から直接 "
+                   "<code>:hold</code> へ分岐し、<code>:request-approval</code> ノードを通らないためです。")
+              ["op" "対象" "ガバナー" "ゲート判定" "人間の承認" "最終" "confidence"]
+              (map step-row steps))
+
+     (section "HARD hold — 人間に到達する前に却下された提案"
+              (str "HARD 違反は <code>woodcork.operation</code> の <code>:decide</code> から直接 "
+                   "<code>:hold</code> へ分岐するため、<code>:request-approval</code> ノードには一度も入りません。"
+                   "上書きできる経路はありません。ルール名と説明はガバナーの出力そのものです。")
+              ["対象" "op" "ルール" "ガバナーの説明"]
+              (hold-rows holds))
+
+     (section "監査台帳 (この実行)"
+              "追記のみの判断事実ログ — この実行が生成したすべての提案・却下・コミット。"
+              ["判定" "op" "対象" "根拠" "confidence" "phase 理由"]
+              (map ledger-row ledger))
+
+     "</main>\n"
+     "<footer class=\"muted\">\n"
+     "  <p>生成: <code>clojure -M:dev:render-html</code> &middot; "
+     "cloud-itonami-isic-1629 &middot; 実アクター実行由来 (捏造値なし)</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db steps] :as demo} (run-demo!)
+        ledger (store/ledger db)
+        html (render demo)]
+    (io/make-parents out)
+    (spit out html)
+    (println "wrote" out "("
+             (count steps) "requests,"
+             (count ledger) "ledger facts,"
+             (count (filter #(= :governor-hold (:t %)) ledger)) "HARD holds,"
+             (count (store/maintenance-history db)) "maintenance drafts,"
+             (count (store/shipment-history db)) "shipment drafts )")))
