@@ -43,7 +43,7 @@
   (default `docs/samples/operator-console.html`)."
   (:require [jp-go-dds.skin]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [langgraph.graph :as g]
             [woodcork.governor :as governor]
             [woodcork.operation :as op]
