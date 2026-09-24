@@ -1,0 +1,31 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README has no "Robotics premise" section. The shop makes other wood
+;; products and articles of cork, straw and plaiting materials. Its physical
+;; work here (the cork line): boiling raw cork planks before stopper punching,
+;; and draining the boiling tank after the batch.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-1629"
+ :cases
+ [{:id :cork-plank-boiling
+   :kind :thermal
+   :procedure "raw cork planks are immersed in the boiling tank until the middle of each plank reaches 95 C; swept :thickness-m is HALF the thickness (heated face to mid-plane), mid-plane adiabatic by symmetry, so the back face is the middle"
+   :params {:conductivity-w-mk 0.045 :density-kg-m3 240.0 :specific-heat-j-kgk 2000.0
+            :t0-c 15.0 :t-hot-c 100.0 :h-front-w-m2k 500.0 :t-back-ambient-c 15.0 :h-back-w-m2k 0.0
+            :threshold-c 95.0 :duration-s 14400.0 :nodes 11}
+   :sweep {:param :thickness-m :values [0.010 0.015 0.020 0.025 0.030]}
+   :quantity :time-to-threshold-s
+   :limit {:max 3600.0 :basis "estimate: a one-hour boiling batch; the middle of the plank must reach 95 C within it"}
+   :boundary {:lo 0.005 :hi 0.06}}
+  {:id :boiling-tank-drain
+   :kind :tank-drain
+   :procedure "drain the cork boiling tank (tannin-laden water) through its bottom valve to the effluent pit after the batch"
+   :params {:tank-area-m2 6.0 :h0-m 1.5 :h-target-m 0.05 :cd 0.62 :q-in-m3s 0.0}
+   :sweep {:param :orifice-area-m2 :values [0.003 0.006 0.010 0.015 0.020]}
+   :quantity :time-to-target-s
+   :limit {:max 900.0 :basis "estimate: 15-minute turnaround slot between boiling batches"}
+   :boundary {:lo 0.001 :hi 0.05}}]}
